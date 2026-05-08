@@ -13,6 +13,8 @@
 #   - https://github.com/boltgolt/howdy/issues/912  (ConfigParser)
 #   - https://github.com/boltgolt/howdy/issues/954  (PEP 668)
 #   - https://github.com/boltgolt/howdy/issues/1027 (Python 2 commands)
+#   - https://github.com/boltgolt/howdy/issues/890  (Ubuntu 24.04 LTS)
+#   - https://github.com/boltgolt/howdy/issues/774  (externally-managed)
 #
 
 set -e
@@ -82,49 +84,49 @@ echo -e "\n${BLUE}🔧 Fix 2: Patching video_capture.py for V4L2 backend...${NC}
 
 VIDEO_CAPTURE_FILE="$HOWDY_PATH/recorders/video_capture.py"
 if [[ -f "$VIDEO_CAPTURE_FILE" ]]; then
-    # Check if already patched
-    if grep -q "cv2.CAP_V4L2" "$VIDEO_CAPTURE_FILE" 2>/dev/null; then
-        echo -e "${YELLOW}⚠ video_capture.py already patched with V4L2 backend${NC}"
-    else
-        # Find and patch the VideoCapture line
-        # Original: self.internal = cv2.VideoCapture(self.config.get("video", "device_path"))
-        # Patched:  self.internal = cv2.VideoCapture(self.config.get("video", "device_path"), cv2.CAP_V4L2)
-        sed -i 's/self.internal = cv2.VideoCapture($/self.internal = cv2.VideoCapture(/; /cv2.VideoCapture(/{n;s/self.config.get("video", "device_path")/self.config.get("video", "device_path"), cv2.CAP_V4L2/}' "$VIDEO_CAPTURE_FILE"
-        
-        # Alternative simpler approach - find the exact pattern
-        if ! grep -q "cv2.CAP_V4L2" "$VIDEO_CAPTURE_FILE"; then
-            python3 << 'PYTHON_PATCH'
-import re
-
+    # The previous regex-based patch could match os.path.exists() instead of
+    # cv2.VideoCapture() because both call self.config.get("video", "device_path")
+    # in v2.6.1. We do an exact-block replace and defensively revert the wrong
+    # patch first so this is idempotent and recoverable.
+    python3 << 'PYTHON_PATCH'
 file_path = "/lib/security/howdy/recorders/video_capture.py"
 
 with open(file_path, 'r') as f:
     content = f.read()
 
-# Pattern to match the VideoCapture instantiation without V4L2
-pattern = r'(self\.internal = cv2\.VideoCapture\(\s*\n\s*self\.config\.get\("video", "device_path"\)\s*\n\s*\))'
-replacement = '''self.internal = cv2.VideoCapture(
-                                self.config.get("video", "device_path"), cv2.CAP_V4L2
-                        )'''
+# 1) Revert any previous wrong patch on os.path.exists (which only takes 1 arg)
+wrong = 'os.path.exists(self.config.get("video", "device_path"), cv2.CAP_V4L2)'
+right = 'os.path.exists(self.config.get("video", "device_path"))'
+if wrong in content:
+    content = content.replace(wrong, right)
+    print("Reverted wrong os.path.exists patch from earlier runs")
+
+# 2) Apply correct patch via exact-block match in _create_reader
+old_block = '''self.internal = cv2.VideoCapture(
+				self.config.get("video", "device_path")
+			)'''
+new_block = '''self.internal = cv2.VideoCapture(
+				self.config.get("video", "device_path"), cv2.CAP_V4L2
+			)'''
 
 if 'cv2.CAP_V4L2' not in content:
-    # Try simpler pattern
-    content = re.sub(
-        r'self\.config\.get\("video", "device_path"\)\s*\)',
-        'self.config.get("video", "device_path"), cv2.CAP_V4L2)',
-        content,
-        count=1  # Only first occurrence (the else branch)
-    )
-    
+    if old_block in content:
+        content = content.replace(old_block, new_block, 1)
+        with open(file_path, 'w') as f:
+            f.write(content)
+        print("Patched VideoCapture in _create_reader with cv2.CAP_V4L2 backend")
+    else:
+        # Save reverted content if any
+        with open(file_path, 'w') as f:
+            f.write(content)
+        print("WARNING: could not locate VideoCapture block — file structure may differ from v2.6.1")
+else:
+    # Make sure any revert is persisted
     with open(file_path, 'w') as f:
         f.write(content)
-    print("Patched successfully")
-else:
-    print("Already patched")
+    print("Already patched with V4L2 backend")
 PYTHON_PATCH
-        fi
-        echo -e "${GREEN}✓ Patched video_capture.py to use V4L2 backend${NC}"
-    fi
+    echo -e "${GREEN}✓ video_capture.py V4L2 backend handled${NC}"
 else
     echo -e "${RED}❌ video_capture.py not found${NC}"
 fi
@@ -143,6 +145,100 @@ else
         echo -e "${YELLOW}   sudo pip3 install dlib --break-system-packages${NC}"
     }
 fi
+
+# ═══════════════════════════════════════════════════════════════
+# FIX 4: pam.py subprocess.call needs cwd + PYTHONPATH
+# ═══════════════════════════════════════════════════════════════
+# Without these, compare.py runs with the wrong working directory under PAM
+# and its sibling-module imports (`from recorders.video_capture import …`)
+# fail with ModuleNotFoundError at every sudo invocation. We also redirect
+# stdout/stderr to DEVNULL so cosmetic OpenCV/Python warnings don't leak
+# into sudo's terminal output. Reported in boltgolt/howdy issues #890, #1046.
+echo -e "\n${BLUE}🔧 Fix 4: Patching pam.py subprocess.call (cwd + PYTHONPATH + silenced output)...${NC}"
+
+if grep -q "PYTHONPATH" "$PAM_FILE" 2>/dev/null; then
+    echo -e "${YELLOW}⚠ pam.py subprocess already patched${NC}"
+else
+    python3 << 'PYTHON_PATCH'
+p = "/lib/security/howdy/pam.py"
+with open(p) as f: content = f.read()
+
+old = '\t# Run compare as python3 subprocess to circumvent python version and import issues\n\tstatus = subprocess.call(["/usr/bin/python3", os.path.dirname(os.path.abspath(__file__)) + "/compare.py", pamh.get_user()])'
+new = '''\t# Run compare as python3 subprocess to circumvent python version and import issues
+\thowdy_dir = os.path.dirname(os.path.abspath(__file__))
+\tenv = os.environ.copy()
+\tenv["PYTHONPATH"] = howdy_dir + (":" + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
+\tstatus = subprocess.call(
+\t\t["/usr/bin/python3", howdy_dir + "/compare.py", pamh.get_user()],
+\t\tcwd=howdy_dir,
+\t\tenv=env,
+\t\tstdout=subprocess.DEVNULL,
+\t\tstderr=subprocess.DEVNULL,
+\t)'''
+
+if old in content:
+    content = content.replace(old, new)
+    with open(p, 'w') as f:
+        f.write(content)
+    print("Patched")
+else:
+    print("WARNING: subprocess.call block not found — manual fix required")
+PYTHON_PATCH
+    echo -e "${GREEN}✓ Patched pam.py subprocess.call${NC}"
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# FIX 5: compare.py needs sys.path.insert for sibling imports
+# ═══════════════════════════════════════════════════════════════
+# compare.py uses `from recorders.video_capture import …` and `import snapshot`,
+# both of which are sibling modules. Without sys.path containing its own
+# directory, these imports fail when compare.py is launched as a subprocess
+# from pam.py (the script's own dir is not in sys.path by default in that
+# context). Belt-and-suspenders alongside FIX 4.
+echo -e "\n${BLUE}🔧 Fix 5: Patching compare.py for sibling-module imports...${NC}"
+
+COMPARE_FILE="$HOWDY_PATH/compare.py"
+if [[ ! -f "$COMPARE_FILE" ]]; then
+    echo -e "${RED}❌ compare.py not found${NC}"
+elif head -10 "$COMPARE_FILE" | grep -q "sys.path.insert"; then
+    echo -e "${YELLOW}⚠ compare.py already has sys.path.insert${NC}"
+else
+    python3 << 'PYTHON_PATCH'
+p = "/lib/security/howdy/compare.py"
+with open(p) as f: lines = f.readlines()
+
+inject = "import sys, os as _os\nsys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))\n"
+
+# Insert at the first non-comment, non-blank line so it runs before any imports
+insert_idx = 0
+for i, l in enumerate(lines):
+    if l.strip() and not l.strip().startswith("#"):
+        insert_idx = i
+        break
+
+lines.insert(insert_idx, inject)
+with open(p, 'w') as f:
+    f.writelines(lines)
+print("Patched")
+PYTHON_PATCH
+    echo -e "${GREEN}✓ Prepended sys.path.insert to compare.py${NC}"
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# FIX 6: Directory permissions (must be 755 to be traversable)
+# ═══════════════════════════════════════════════════════════════
+# Howdy's postinst on some systems runs `chmod 744 -R /lib/security/howdy/`
+# which strips the execute bit from directories. Files at 744 are fine, but
+# directories at 744 cannot be traversed (no `x`), and PAM's subprocess
+# can't reach files inside `recorders/`, `cli/`, etc. We restore 755 on
+# directories while keeping 644 on files (and 755 on known executables).
+echo -e "\n${BLUE}🔧 Fix 6: Restoring directory permissions (755 traversable)...${NC}"
+
+find "$HOWDY_PATH" -type d -exec chmod 755 {} +
+find "$HOWDY_PATH" -type f -exec chmod 644 {} +
+chmod 755 "$HOWDY_PATH/cli.py" 2>/dev/null || true
+chmod 755 "$HOWDY_PATH/dlib-data/install.sh" 2>/dev/null || true
+echo -e "${GREEN}✓ Directories 755, files 644, executables 755${NC}"
 
 # ═══════════════════════════════════════════════════════════════
 # Verification

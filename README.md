@@ -71,7 +71,11 @@ The old Howdy package is incompatible with Python 3.10+
 |-------|--------|-------|
 | **Python Module** | `import ConfigParser` (Python 2) | `import configparser` (Python 3) |
 | **Camera Backend** | GStreamer (broken) | V4L2 (works) |
+| **V4L2 patch precision** | Regex matched the wrong line (`os.path.exists`) on v2.6.1 | Exact-block match on `cv2.VideoCapture` in `_create_reader` only |
 | **dlib Dependency** | Blocked by PEP 668 | Installed with workaround |
+| **PAM subprocess** | `compare.py` runs without cwd/PYTHONPATH → `ModuleNotFoundError: No module named 'recorders.video_capture'` on every `sudo` | `cwd=howdy_dir`, `PYTHONPATH` set, `stdout`/`stderr` silenced |
+| **compare.py imports** | Same-dir imports (`from recorders.video_capture import …`, `import snapshot`) fail under PAM | `sys.path.insert` prepended so its directory is searched first |
+| **Directory permissions** | `chmod 744 -R` from postinst strips `x` from dirs → PAM can't traverse `recorders/`, `cli/`, etc. | Dirs `755`, files `644`, executables `755` |
 
 ---
 
@@ -184,17 +188,57 @@ self.internal = cv2.VideoCapture(
 sudo pip3 install dlib --break-system-packages
 ```
 
+### Fix 4: pam.py subprocess needs cwd + PYTHONPATH
+
+Edit `/lib/security/howdy/pam.py` and replace the `subprocess.call` block:
+
+```python
+# Before:
+status = subprocess.call(["/usr/bin/python3", os.path.dirname(os.path.abspath(__file__)) + "/compare.py", pamh.get_user()])
+
+# After:
+howdy_dir = os.path.dirname(os.path.abspath(__file__))
+env = os.environ.copy()
+env["PYTHONPATH"] = howdy_dir + (":" + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
+status = subprocess.call(
+    ["/usr/bin/python3", howdy_dir + "/compare.py", pamh.get_user()],
+    cwd=howdy_dir,
+    env=env,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+```
+
+### Fix 5: compare.py needs sys.path.insert
+
+Prepend these two lines at the top of `/lib/security/howdy/compare.py` (before any imports):
+
+```python
+import sys, os as _os
+sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+```
+
+### Fix 6: Restore directory permissions to 755
+
+```bash
+sudo find /lib/security/howdy -type d -exec chmod 755 {} +
+sudo find /lib/security/howdy -type f -exec chmod 644 {} +
+sudo chmod 755 /lib/security/howdy/cli.py
+sudo chmod 755 /lib/security/howdy/dlib-data/install.sh
+```
+
 ---
 
 ## 🔗 Related Howdy Issues
 
 This patcher was created to solve these open issues:
 
+- [#774 - externally-managed-environment](https://github.com/boltgolt/howdy/issues/774)
+- [#890 - Ubuntu 24.04 LTS](https://github.com/boltgolt/howdy/issues/890)
 - [#912 - Howdy can't import module ConfigParser](https://github.com/boltgolt/howdy/issues/912)
+- [#935 - Ubuntu 24.04 LTS issues](https://github.com/boltgolt/howdy/issues/935)
 - [#954 - externally-managed-environment error](https://github.com/boltgolt/howdy/issues/954)
 - [#1027 - Python 2 commands in pam script](https://github.com/boltgolt/howdy/issues/1027)
-- [#935 - Ubuntu 24.04 LTS issues](https://github.com/boltgolt/howdy/issues/935)
-- [#890 - Ubuntu 24.04 LTS](https://github.com/boltgolt/howdy/issues/890)
 - [#1046 - Howdy PAM module fails on Ubuntu 25.04](https://github.com/boltgolt/howdy/issues/1046)
 
 ---
